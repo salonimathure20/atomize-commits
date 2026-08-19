@@ -15,7 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from splitter.features import build_features
+from splitter.features import build_features, disk_source
 from splitter.gitrepo import Repo
 from splitter.grouping import build_graph, cluster, score_pair
 from splitter.parser import all_hunks, parse_diff
@@ -146,7 +146,7 @@ def test_same_file_different_functions_scores_low(repo: Path):
     """The signal that rescues the tangled-file case."""
     tangle(repo)
     _, files = load(repo)
-    profiles = build_features(str(repo), files)
+    profiles = build_features(disk_source(str(repo)), files)
     routes = [p for p in profiles if p.path.endswith("routes.py") and p.symbol]
     login = [p for p in routes if p.symbol == "login_route"]
     checkout = [p for p in routes if p.symbol == "checkout_route"]
@@ -159,7 +159,7 @@ def test_same_file_different_functions_scores_low(repo: Path):
 def test_definition_and_its_user_score_high(repo: Path):
     tangle(repo)
     _, files = load(repo)
-    profiles = build_features(str(repo), files)
+    profiles = build_features(disk_source(str(repo)), files)
     auth = [p for p in profiles if p.path.endswith("auth.py")][0]
     login = [p for p in profiles if p.symbol == "login_route"][0]
     score, reasons = score_pair(auth, login)
@@ -172,7 +172,7 @@ def test_definition_and_its_user_score_high(repo: Path):
 def test_tangled_file_splits_by_feature(repo: Path):
     tangle(repo)
     _, files = load(repo)
-    profiles = build_features(str(repo), files)
+    profiles = build_features(disk_source(str(repo)), files)
     graph, _ = build_graph(profiles, {})
     groups = cluster(graph)
 
@@ -205,7 +205,7 @@ def test_import_lines_follow_their_feature(repo: Path):
     """
     tangle(repo)
     _, files = load(repo)
-    profiles = build_features(str(repo), files)
+    profiles = build_features(disk_source(str(repo)), files)
     graph, _ = build_graph(profiles, {})
     groups = cluster(graph)
     by_id = {p.hunk_id: p for p in profiles}

@@ -11,8 +11,33 @@ import re
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
+from typing import Callable
+
 from .models import FileDiff, Hunk
 from .symbols import defined_names, enclosing_symbols, identifiers, read_file
+
+# A Source answers "give me the current lines of this file". Everything that
+# needs file contents goes through one, so the analysis never has to know
+# whether it is running next to a checkout or inside a stateless web service.
+Source = Callable[[str], list[str]]
+
+
+def disk_source(repo_root: str) -> Source:
+    """Read files from a working tree. Used by the CLI."""
+    return lambda path: read_file(repo_root, path)
+
+
+def mapping_source(contents: dict[str, str]) -> Source:
+    """Read files from a dict sent over the wire. Used by the service.
+
+    Missing entries return an empty list rather than raising: symbol detection
+    degrades to "unknown scope" instead of failing the whole request.
+    """
+    return lambda path: contents.get(path, "").split("\n")
+
+
+def empty_source() -> Source:
+    return lambda path: []
 
 TEST_MARKERS = ("test_", "_test", ".test.", ".spec.", "/tests/", "/test/", "spec_")
 
@@ -63,14 +88,18 @@ class HunkFeatures:
         return where
 
 
-def build_features(repo_root: str, files: list[FileDiff]) -> list[HunkFeatures]:
-    """Turn parsed hunks into profile cards."""
+def build_features(source: Source, files: list[FileDiff]) -> list[HunkFeatures]:
+    """Turn parsed hunks into profile cards.
+
+    `source` supplies file contents. Pass disk_source(root) locally or
+    mapping_source(dict) when the contents arrived over HTTP.
+    """
     profiles: list[HunkFeatures] = []
 
     for fd in files:
         if fd.is_atomic:
             continue
-        source = read_file(repo_root, fd.path)
+        lines = source(fd.path)
         lowered_path = fd.path.lower()
 
         for hunk in fd.hunks:
@@ -81,7 +110,7 @@ def build_features(repo_root: str, files: list[FileDiff]) -> list[HunkFeatures]:
             # If this hunk introduces a definition, that definition IS its
             # scope. Scanning upward would land us in the previous function,
             # because an inserted block starts with the blank lines above it.
-            scope = enclosing_symbols(source, hunk.first_changed_line)
+            scope = enclosing_symbols(lines, hunk.first_changed_line)
             if introduced:
                 first = _first_defined(added)
                 if first and first not in scope:

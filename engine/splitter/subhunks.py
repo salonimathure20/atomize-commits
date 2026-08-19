@@ -24,9 +24,13 @@ we cut it at those boundaries and emit one sub-hunk per definition. Each piece
 becomes a zero-context insertion anchored at the same HEAD line, which git
 applies happily (we already pass --unidiff-zero).
 
-We only touch runs that are purely additions. Mixed add/remove regions are
-left alone, because reasoning about them is where correctness bugs live and
-they are rarer in practice.
+We only touch hunks that are purely additions. Mixed add/remove regions are
+left alone, because reasoning about them is where correctness bugs live.
+
+A hunk can hold several separate blocks of added lines with untouched code
+between them — git merges nearby edits into one hunk. Each block is handled
+independently, which matters: in a short file, an import block and a function
+added forty lines apart can still arrive as a single hunk.
 """
 
 from __future__ import annotations
@@ -130,42 +134,41 @@ def split_hunk(hunk: Hunk) -> list[Hunk]:
     if run_start is not None:
         runs.append((run_start, len(body), run_old, run_new))
 
-    # Only split when exactly one run dominates and it has cut points.
-    if len(runs) != 1:
-        return [hunk]
-    if any(ln.startswith("-") for ln in body):
-        return [hunk]                      # mixed hunk: too risky, keep whole
-
-    start, end, old_at, new_at = runs[0]
-    added = [ln[1:] for ln in body[start:end]]
-
-    # Try definition boundaries first, then import boundaries. Definitions
-    # need a run of some size; imports do not, because two adjacent import
-    # lines are already the problem.
-    cuts = _cut_points(added) if (end - start) >= MIN_RUN else []
-    if len(cuts) < 2:
-        cuts = _import_cut_points(added)
-    if len(cuts) < 2:
+    # Deletions make position tracking subtle, so we leave those hunks whole.
+    # Pure insertions are safe: every piece anchors at a known HEAD line.
+    if any(ln.startswith("-") for ln in body) or not runs:
         return [hunk]
 
     pieces: list[Hunk] = []
-    bounds = cuts + [len(added)]
-    for n in range(len(cuts)):
-        lo, hi = bounds[n], bounds[n + 1]
-        segment = ["+" + ln for ln in added[lo:hi]]
-        if not any(ln[1:].strip() for ln in segment):
-            continue                        # blank-only piece, skip
-        pieces.append(
-            Hunk(
-                path=hunk.path,
-                old_start=old_at,
-                old_count=0,               # pure insertion at this anchor
-                new_start=new_at + lo,
-                new_count=len(segment),
-                lines=segment,
-                order=hunk.order,
+    for start, end, old_at, new_at in runs:
+        added = [ln[1:] for ln in body[start:end]]
+
+        # Try definition boundaries, then import boundaries. Definitions need
+        # a run of some size; imports do not, because two adjacent import
+        # lines are already the problem.
+        cuts = _cut_points(added) if len(added) >= MIN_RUN else []
+        if len(cuts) < 2:
+            cuts = _import_cut_points(added)
+        if len(cuts) < 2:
+            cuts = [0]                      # keep this run intact
+
+        bounds = cuts + [len(added)]
+        for n in range(len(cuts)):
+            lo, hi = bounds[n], bounds[n + 1]
+            segment = ["+" + ln for ln in added[lo:hi]]
+            if not any(ln[1:].strip() for ln in segment):
+                continue                    # blank-only piece
+            pieces.append(
+                Hunk(
+                    path=hunk.path,
+                    old_start=old_at,
+                    old_count=0,           # pure insertion at this anchor
+                    new_start=new_at + lo,
+                    new_count=len(segment),
+                    lines=segment,
+                    order=hunk.order,
+                )
             )
-        )
 
     return pieces if len(pieces) >= 2 else [hunk]
 

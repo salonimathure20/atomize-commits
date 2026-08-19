@@ -12,9 +12,12 @@ provably correct.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+from pathlib import Path
 
-from .features import build_features
+from .core import analyze
+from .features import build_features, disk_source
 from .gitrepo import GitError, Repo
 from .grouping import build_graph, cluster, co_change_matrix, explain_group
 from .llm import LLMError, provider_from_env
@@ -95,7 +98,7 @@ def cmd_group(args) -> int:
     """Propose a split. This is Phase 2: still no AI, just structure."""
     repo = Repo(args.repo)
     files = load(repo)
-    profiles = build_features(str(repo.root), files)
+    profiles = build_features(disk_source(str(repo.root)), files)
 
     if not profiles:
         print("Nothing to group.")
@@ -131,54 +134,31 @@ def cmd_group(args) -> int:
     return 0
 
 
-def _plan(repo: Repo, use_history: bool):
-    """Compute the proposed split once. Returns (groups, profiles-by-id, edges)."""
-    files = load(repo)
-    profiles = build_features(str(repo.root), files)
-    history = co_change_matrix(repo) if use_history else {}
-    graph, edges = build_graph(profiles, history)
-    return files, profiles, cluster(graph), edges
+def _analyze(repo: Repo, use_history: bool, use_model: bool):
+    """Collect what the analysis needs from git, then hand off to core.
 
-
-def _prepare(repo: Repo, use_history: bool, use_model: bool):
-    """Group, order, and name the commits. Returns (plan, warnings).
-
-    A plan entry is (message, content-key set, members).
+    Everything git-specific happens here. The actual splitting lives in
+    core.analyze, which the web service calls with exactly the same inputs.
     """
-    warnings: list[str] = []
-    _, profiles, groups, _ = _plan(repo, use_history)
-    if not groups:
-        return [], warnings
+    repo.intent_to_add(repo.untracked())
+    diff_text = repo.working_diff()
 
-    by_id = {p.hunk_id: p for p in profiles}
-    member_groups = [[by_id[hid] for hid in g] for g in groups]
-
-    # 1. Order so that a commit never uses something a later commit creates.
-    order, cycle_warnings = order_groups(member_groups)
-    warnings.extend(cycle_warnings)
-    member_groups = [member_groups[i] for i in order]
-
-    for index, dangling in missing_references(member_groups):
-        names = ", ".join(sorted(dangling)[:3])
-        warnings.append(f"commit {index + 1} references {names} before it exists")
-
-    # 2. Name them.
     provider = None
+    warnings: list[str] = []
     if use_model:
         try:
             provider = provider_from_env()
         except LLMError as exc:
             warnings.append(str(exc))
-    messages, message_warning = generate_messages(member_groups, provider)
-    if message_warning:
-        warnings.append(message_warning)
 
-    from .patch import content_key
-    plan = []
-    for message, members in zip(messages, member_groups):
-        wanted = frozenset().union(*(content_key(m.hunk) for m in members))
-        plan.append((message, wanted, members))
-    return plan, warnings
+    result = analyze(
+        diff_text,
+        source=disk_source(str(repo.root)),
+        co_change=co_change_matrix(repo) if use_history else {},
+        provider=provider,
+    )
+    result.warnings = warnings + result.warnings
+    return result
 
 
 def cmd_apply(args) -> int:
@@ -193,26 +173,60 @@ def cmd_apply(args) -> int:
         print("Index is not clean. Unstage first (git reset).", file=sys.stderr)
         return 2
 
-    plan, warnings = _prepare(repo, not args.no_history, not args.no_model)
-    if not plan:
+    if args.plan:
+        # Execute a plan the user reviewed and possibly edited. Messages and
+        # groupings may differ from what we would have proposed; that is the
+        # point of letting a human look at it first.
+        import json
+        try:
+            saved = json.loads(Path(args.plan).read_text())
+        except (OSError, ValueError) as exc:
+            print(f"could not read plan: {exc}", file=sys.stderr)
+            return 2
+        entries = [
+            (c["message"]["full"], frozenset(c["content_key"]))
+            for c in saved.get("commits", [])
+            if c.get("content_key")
+        ]
+        if not entries:
+            print("plan contains no commits", file=sys.stderr)
+            return 2
+        return _execute(repo, entries)
+
+    result = _analyze(repo, not args.no_history, not args.no_model)
+    if not result.commits:
         print("Nothing to commit.")
         return 0
 
-    for warning in warnings:
+    for warning in result.warnings:
         print(f"note: {warning}", file=sys.stderr)
 
     if args.dry_run:
-        for n, (message, _, members) in enumerate(plan, start=1):
-            print(f"\n[{n}] {message.header()}   ({message.generated_by})")
-            if message.body:
-                print(f"      {message.body}")
-            for m in sorted(members, key=lambda x: x.path):
+        for n, commit in enumerate(result.commits, start=1):
+            print(f"\n[{n}] {commit.message.header()}   "
+                  f"({commit.message.generated_by})")
+            if commit.message.body:
+                print(f"      {commit.message.body}")
+            for m in sorted(commit.members, key=lambda x: x.path):
                 print(f"      {m.label()}")
         return 0
 
+    return _execute(
+        repo,
+        [(c.message.full(), c.content_keys()) for c in result.commits],
+    )
+
+
+def _execute(repo: Repo, entries) -> int:
+    """Commit each (message, content-key set) in turn.
+
+    The diff is re-read between commits because hunk ids shift once one
+    lands; matching on changed text is what survives that.
+    """
     from .patch import match_by_content
-    for n, (message, wanted, _) in enumerate(plan, start=1):
-        files = load(repo)                      # fresh view after each commit
+
+    for n, (message, wanted) in enumerate(entries, start=1):
+        files = load(repo)
         selected = match_by_content(files, wanted)
         if not selected:
             print(f"[{n}] nothing left to match; skipping", file=sys.stderr)
@@ -225,12 +239,33 @@ def cmd_apply(args) -> int:
             repo.reset_index()
             return 1
 
-        sha = repo.commit(message.full())
-        print(f"{sha}  {message.header()}")
+        sha = repo.commit(message)
+        print(f"{sha}  {message.splitlines()[0]}")
 
     leftover = all_hunks(load(repo))
     if leftover:
         print(f"\n{len(leftover)} hunk(s) left unassigned; run `list` to see them.")
+    return 0
+
+
+def cmd_plan(args) -> int:
+    """Emit the proposed split as JSON, for other programs to consume.
+
+    This is the seam the editor extension talks through. Keeping it a plain
+    subprocess call means the extension never reimplements any of the
+    analysis, and everything stays covered by the Python tests.
+    """
+    import json
+
+    repo = Repo(args.repo)
+    result = _analyze(repo, not args.no_history, not args.no_model)
+    try:
+        print(json.dumps(result.to_dict(), indent=2 if args.pretty else None))
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # The reader closed early (a `| head`, or an editor that gave up).
+        # Nothing was committed, so this is not an error.
+        os._exit(0)
     return 0
 
 
@@ -299,7 +334,7 @@ def cmd_why(args) -> int:
     """Show the raw pairwise scores. Use this when tuning the weights."""
     repo = Repo(args.repo)
     files = load(repo)
-    profiles = build_features(str(repo.root), files)
+    profiles = build_features(disk_source(str(repo.root)), files)
     history = {} if args.no_history else co_change_matrix(repo)
     _, edges = build_graph(profiles, history)
 
@@ -374,7 +409,15 @@ def main(argv: list[str] | None = None) -> int:
                          help="show the plan without committing")
     p_apply.add_argument("--no-model", action="store_true",
                          help="skip the language model, use heuristic messages")
+    p_apply.add_argument("--plan", metavar="FILE",
+                         help="execute a reviewed plan produced by `plan`")
     p_apply.set_defaults(func=cmd_apply)
+
+    p_plan = sub.add_parser("plan", help="emit the proposed split as JSON")
+    p_plan.add_argument("--no-history", action="store_true")
+    p_plan.add_argument("--no-model", action="store_true")
+    p_plan.add_argument("--pretty", action="store_true")
+    p_plan.set_defaults(func=cmd_plan)
 
     p_doctor = sub.add_parser("doctor", help="check the model configuration")
     p_doctor.set_defaults(func=cmd_doctor)

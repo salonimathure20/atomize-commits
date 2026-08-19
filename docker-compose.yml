@@ -1,0 +1,41 @@
+# Local development. One command to build and run the service.
+#
+#   docker compose up --build          start it
+#   curl localhost:8000/health         check it
+#   docker compose down                stop it
+
+services:
+  splitter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: commit-splitter:local
+    ports:
+      - "8000:8000"
+    environment:
+      # Commit messages. Leave as "none" for heuristics, or point at a model.
+      SPLITTER_LLM: "${SPLITTER_LLM:-none}"
+      SPLITTER_MODEL: "${SPLITTER_MODEL:-}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      # host.docker.internal reaches your laptop from inside the container,
+      # which is how a containerised service talks to Ollama running natively.
+      OLLAMA_HOST: "${OLLAMA_HOST:-http://host.docker.internal:11434}"
+      LOG_LEVEL: "INFO"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    # The service holds no state, so it is always safe to restart.
+    restart: unless-stopped
+    # Caps so a runaway request cannot eat the whole machine. Kubernetes calls
+    # these resource limits; the idea is identical.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
