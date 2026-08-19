@@ -1,0 +1,80 @@
+name: Commit hygiene
+
+# Runs on every pull request. Builds the analysis service, sends it the PR's
+# diff, and leaves a comment if the PR bundles several unrelated changes.
+#
+# The container is what makes this practical: CI gets a working engine without
+# installing Python packages, pinning versions, or caching a virtualenv. It
+# either runs or it does not.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# Only the comment needs write access. Everything else is read-only.
+permissions:
+  contents: read
+  pull-requests: write
+
+# A second push should replace the first run, not race it.
+concurrency:
+  group: hygiene-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@v4
+        with:
+          # We diff against the merge base, so we need history, not just the
+          # tip commit that a shallow clone would give us.
+          fetch-depth: 0
+
+      - name: Build the analysis image
+        run: docker build -t commit-splitter:ci .
+
+      - name: Start the service
+        run: |
+          docker run -d --name splitter \
+            -p 8000:8000 \
+            -e SPLITTER_LLM="${{ vars.SPLITTER_LLM || 'none' }}" \
+            -e SPLITTER_MODEL="${{ vars.SPLITTER_MODEL || '' }}" \
+            -e GEMINI_API_KEY="${{ secrets.GEMINI_API_KEY }}" \
+            -e ANTHROPIC_API_KEY="${{ secrets.ANTHROPIC_API_KEY }}" \
+            commit-splitter:ci
+
+          # Wait for readiness rather than sleeping a fixed number of seconds.
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://localhost:8000/health > /dev/null; then
+              echo "service is up after ${attempt}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "service did not become healthy"
+          docker logs splitter
+          exit 1
+
+      - name: Check commit hygiene
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 ci/hygiene.py \
+            --service http://localhost:8000 \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.event.pull_request.head.sha }}" \
+            --min-commits 2
+
+      - name: Show service logs on failure
+        if: failure()
+        run: docker logs splitter
+
+      - name: Stop the service
+        if: always()
+        run: docker rm -f splitter || true

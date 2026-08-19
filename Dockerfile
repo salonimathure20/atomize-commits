@@ -29,7 +29,7 @@ COPY --from=builder /install /usr/local
 
 WORKDIR /app
 COPY --chown=splitter:splitter engine/splitter ./engine/splitter
-COPY --chown=splitter:splitter service/app.py ./service/app.py
+COPY --chown=splitter:splitter service/app.py service/schemas.py ./service/
 
 USER splitter
 
@@ -46,16 +46,12 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
 
-# gunicorn, not flask's development server: it handles concurrent requests,
-# recycles workers, and is built for production traffic.
-#   --workers 2        two processes; raise it on a bigger machine
-#   --threads 4        each handles several requests while waiting on the model
-#   --timeout 120      model calls can be slow
-CMD ["gunicorn", \
-     "--bind", "0.0.0.0:8000", \
-     "--workers", "2", \
-     "--threads", "4", \
-     "--timeout", "120", \
-     "--access-logfile", "-", \
-     "--chdir", "/app/service", \
-     "app:app"]
+# uvicorn is the ASGI server FastAPI runs on.
+#   --workers 2   two processes; raise it on a bigger machine. Each has its own
+#                 event loop, and blocking work goes to a thread pool, so a
+#                 slow model call does not stall other requests.
+WORKDIR /app/service
+CMD ["uvicorn", "app:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--workers", "2"]

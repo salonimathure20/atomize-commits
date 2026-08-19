@@ -1,17 +1,15 @@
 """HTTP wrapper around the analysis engine.
 
-The service is deliberately stateless: it never clones a repository, never
-writes to disk, and holds nothing between requests. A caller sends a diff and
-(optionally) the current contents of the changed files; the service sends back
-a proposed split. That property is what makes it trivial to containerise and
-to scale horizontally — any replica can answer any request.
+The service is stateless: it never clones a repository, writes to disk, or
+holds anything between requests. Any replica can answer any request, which is
+what makes it straightforward to scale. It also never commits — applying
+commits needs the caller's working tree and git credentials, so that stays
+client-side.
 
-It also never commits anything. Applying commits requires the caller's working
-tree and their git credentials, so that stays entirely client-side. The
-service only advises.
+Interactive documentation is generated from the schemas and served at /docs.
 
 Endpoints
-    GET  /health   liveness, for Docker and Kubernetes probes
+    GET  /health   liveness, for container and Kubernetes probes
     GET  /ready    readiness, reports whether a model is configured
     POST /analyze  the actual work
 """
@@ -22,15 +20,26 @@ import logging
 import os
 import sys
 import time
+from contextlib import asynccontextmanager
 
-from flask import Flask, g, jsonify, request
+from fastapi import FastAPI, Request, status
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "engine"))
 
-from splitter import __version__
-from splitter.core import analyze
-from splitter.features import mapping_source
-from splitter.llm import LLMError, provider_from_env
+from schemas import (  # noqa: E402
+    AnalyzeRequest,
+    AnalyzeResponse,
+    ErrorResponse,
+    HealthResponse,
+    ModelStatus,
+    ReadyResponse,
+)
+from splitter import __version__  # noqa: E402
+from splitter.core import analyze  # noqa: E402
+from splitter.features import mapping_source  # noqa: E402
+from splitter.llm import LLMError, provider_from_env  # noqa: E402
 
 MAX_DIFF_BYTES = int(os.environ.get("MAX_DIFF_BYTES", 2_000_000))
 MAX_FILES = int(os.environ.get("MAX_FILES", 500))
@@ -41,110 +50,138 @@ logging.basicConfig(
 )
 log = logging.getLogger("splitter.service")
 
-app = Flask(__name__)
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    log.info("commit-splitter %s starting", __version__)
+    yield
+    log.info("shutting down")
 
 
-@app.before_request
-def _start_timer():
-    g.started = time.monotonic()
+app = FastAPI(
+    title="Commit Splitter",
+    version=__version__,
+    summary="Splits a tangled diff into separate, well-described commits.",
+    description=(
+        "Send a diff and get back a proposed set of atomic commits, ordered so "
+        "that nothing is used before it exists, each with a Conventional "
+        "Commits message.\n\n"
+        "The service is stateless and never commits anything itself."
+    ),
+    lifespan=lifespan,
+)
 
 
-@app.after_request
-def _log_request(response):
-    elapsed = (time.monotonic() - getattr(g, "started", time.monotonic())) * 1000
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    started = time.monotonic()
+    response = await call_next(request)
+    elapsed = (time.monotonic() - started) * 1000
     log.info("%s %s -> %s in %.0fms",
-             request.method, request.path, response.status_code, elapsed)
+             request.method, request.url.path, response.status_code, elapsed)
     return response
 
 
-@app.get("/health")
-def health():
-    """Is the process alive? Cheap, no dependencies touched."""
-    return jsonify(status="ok", version=__version__)
+@app.exception_handler(Exception)
+async def unhandled_error(_: Request, exc: Exception):
+    """Never let a stack trace reach a caller; it may contain their source."""
+    log.exception("unhandled error", exc_info=exc)
+    return JSONResponse(status_code=500, content={"error": "analysis failed"})
 
 
-@app.get("/ready")
-def ready():
-    """Can we serve real traffic?
+@app.get(
+    "/health",
+    response_model=HealthResponse,
+    summary="Liveness probe",
+    tags=["operations"],
+)
+async def health() -> HealthResponse:
+    """Cheap check that the process is alive. Touches no dependencies."""
+    return HealthResponse(status="ok", version=__version__)
+
+
+@app.get(
+    "/ready",
+    response_model=ReadyResponse,
+    summary="Readiness probe",
+    tags=["operations"],
+)
+async def ready() -> ReadyResponse:
+    """Report whether we can serve real traffic.
 
     A missing model is not fatal — the engine falls back to heuristic
     messages — so this reports the model's state without failing.
     """
     try:
         provider = provider_from_env()
-        model = {"configured": provider is not None,
-                 "provider": provider.name if provider else None}
+        model = ModelStatus(
+            configured=provider is not None,
+            provider=provider.name if provider else None,
+        )
     except LLMError as exc:
-        model = {"configured": False, "error": str(exc)}
-    return jsonify(status="ok", version=__version__, model=model)
+        model = ModelStatus(configured=False, error=str(exc))
+    return ReadyResponse(status="ok", version=__version__, model=model)
 
 
-@app.post("/analyze")
-def analyze_endpoint():
-    """Split a diff into proposed commits.
+@app.post(
+    "/analyze",
+    response_model=AnalyzeResponse,
+    summary="Split a diff into proposed commits",
+    tags=["analysis"],
+    responses={
+        413: {"model": ErrorResponse, "description": "Diff or file set too large"},
+        422: {"description": "Request body failed validation"},
+        500: {"model": ErrorResponse, "description": "Analysis failed"},
+    },
+)
+async def analyze_endpoint(payload: AnalyzeRequest) -> AnalyzeResponse:
+    """Group a working tree's changes into atomic commits.
 
-    Request body:
-        diff      required, the output of `git diff`
-        files     optional, {path: full current contents}. Improves symbol
-                  detection; without it the analysis still works but is coarser.
-        co_change optional, [[path_a, path_b, strength], ...] mined from the
-                  caller's git log
-        messages  optional bool, default true. Set false to skip the model.
+    Shape and types are validated before this function runs. Size limits are
+    checked here so they can return 413 rather than a validation error.
     """
-    payload = request.get_json(silent=True)
-    if not isinstance(payload, dict):
-        return jsonify(error="request body must be a JSON object"), 400
+    if len(payload.diff.encode()) > MAX_DIFF_BYTES:
+        return JSONResponse(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            content={"error": f"diff exceeds {MAX_DIFF_BYTES} bytes"},
+        )
+    if len(payload.files) > MAX_FILES:
+        return JSONResponse(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            content={"error": f"too many files (limit {MAX_FILES})"},
+        )
 
-    diff_text = payload.get("diff")
-    if not isinstance(diff_text, str) or not diff_text.strip():
-        return jsonify(error="'diff' is required and must be a non-empty string"), 400
-    if len(diff_text.encode()) > MAX_DIFF_BYTES:
-        return jsonify(error=f"diff exceeds {MAX_DIFF_BYTES} bytes"), 413
-
-    files = payload.get("files") or {}
-    if not isinstance(files, dict):
-        return jsonify(error="'files' must be an object of path -> contents"), 400
-    if len(files) > MAX_FILES:
-        return jsonify(error=f"too many files (limit {MAX_FILES})"), 413
-
-    co_change = {}
-    for entry in payload.get("co_change") or []:
-        try:
-            a, b, strength = entry
-            co_change[tuple(sorted((str(a), str(b))))] = float(strength)
-        except (TypeError, ValueError):
-            return jsonify(error="'co_change' entries must be [path, path, number]"), 400
-
+    warnings: list[str] = []
     provider = None
-    warnings = []
-    if payload.get("messages", True):
+    if payload.messages:
         try:
             provider = provider_from_env()
         except LLMError as exc:
             warnings.append(str(exc))
 
-    try:
-        result = analyze(
-            diff_text,
-            source=mapping_source({str(k): str(v) for k, v in files.items()}),
-            co_change=co_change,
-            provider=provider,
-        )
-    except Exception:
-        # Never leak a stack trace to a caller; it may contain file contents.
-        log.exception("analysis failed")
-        return jsonify(error="analysis failed"), 500
+    # The analysis is CPU-bound and the model call blocks on the network.
+    # Running it in a worker thread keeps the event loop free to accept other
+    # requests instead of stalling the whole process behind one slow call.
+    result = await run_in_threadpool(
+        analyze,
+        payload.diff,
+        source=mapping_source(payload.files),
+        co_change=payload.co_change_map(),
+        provider=provider,
+    )
 
     body = result.to_dict()
     body["warnings"] = warnings + body["warnings"]
-    return jsonify(body)
-
-
-@app.errorhandler(404)
-def not_found(_):
-    return jsonify(error="not found"), 404
+    return AnalyzeResponse.model_validate(body)
 
 
 if __name__ == "__main__":
-    # Development only. Production uses gunicorn; see the Dockerfile.
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=False)
+    # Development only. The container runs uvicorn directly; see the Dockerfile.
+    import uvicorn
+
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8000)),
+        reload=bool(os.environ.get("RELOAD")),
+    )

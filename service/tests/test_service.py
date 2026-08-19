@@ -1,7 +1,14 @@
-"""Phase 4 tests: the git-free core and the HTTP service.
+"""Service tests, FastAPI version.
 
-Nothing here touches a network or a container. The service is exercised with
-Flask's test client, so these run in CI in under a second.
+Nothing here touches a network or a container. TestClient drives the app
+in-process, so these run in CI in about a second.
+
+One behaviour changed in the port: a malformed request body now returns 422
+instead of 400. That is FastAPI's convention for a body that failed schema
+validation, and it distinguishes "your JSON was the wrong shape" from "your
+request was too big" (413), which is more information than the Flask version
+gave. No client depended on the old code — the extension talks to the CLI, not
+to this service.
 """
 
 from __future__ import annotations
@@ -19,12 +26,14 @@ sys.path.insert(0, str(ROOT / "service"))
 
 os.environ.setdefault("SPLITTER_LLM", "none")
 
-from splitter.core import analyze
-from splitter.features import mapping_source
-from splitter.gitrepo import Repo
-from splitter.parser import parse_diff
-from splitter.patch import build_patch
-from splitter.subhunks import split_all
+from fastapi.testclient import TestClient  # noqa: E402
+
+from splitter.core import analyze  # noqa: E402
+from splitter.features import mapping_source  # noqa: E402
+from splitter.gitrepo import Repo  # noqa: E402
+from splitter.parser import parse_diff  # noqa: E402
+from splitter.patch import build_patch  # noqa: E402
+from splitter.subhunks import split_all  # noqa: E402
 
 BASE = 'from flask import Flask\n\napp = Flask(__name__)\n\n\ndef health():\n    return {"ok": True}\n'
 
@@ -73,15 +82,19 @@ def tangled(tmp_path: Path):
     return tmp_path, diff, contents
 
 
-# --- the regression this phase uncovered -----------------------------------
+@pytest.fixture
+def client():
+    from app import app
+    return TestClient(app)
+
+
+# --- the regression this project keeps rediscovering -----------------------
 
 def test_one_hunk_holding_two_separate_edits_is_split(tangled):
     """A short file merges distant edits into a single hunk.
 
-    The import block and the new routes are forty lines apart in a long file
-    but share one hunk in a short one. Splitting used to bail whenever a hunk
-    contained more than one block of added lines, which silently collapsed
-    both features into a single commit.
+    Splitting used to bail whenever a hunk contained more than one block of
+    added lines, which silently collapsed both features into one commit.
     """
     _, diff, contents = tangled
     result = analyze(diff, source=mapping_source(contents))
@@ -108,8 +121,7 @@ def test_split_pieces_still_apply_as_a_patch(tangled):
 def test_analyze_works_with_no_file_contents(tangled):
     """Symbol detection degrades, but the analysis must not fail."""
     _, diff, _ = tangled
-    result = analyze(diff)
-    assert result.commits
+    assert analyze(diff).commits
 
 
 def test_analyze_on_empty_diff_returns_nothing():
@@ -122,7 +134,7 @@ def test_analysis_serialises_to_json(tangled):
     import json
     _, diff, contents = tangled
     payload = analyze(diff, source=mapping_source(contents)).to_dict()
-    json.dumps(payload)          # must not raise
+    json.dumps(payload)
     commit = payload["commits"][0]
     assert commit["message"]["header"]
     assert commit["files"]
@@ -133,31 +145,26 @@ def test_content_keys_survive_reparsing(tangled):
     """Ids change once a commit lands; content keys are what we match on."""
     _, diff, contents = tangled
     result = analyze(diff, source=mapping_source(contents))
-    assert all(c.content_keys() for c in result.commits)
     first, second = result.commits[0].content_keys(), result.commits[1].content_keys()
+    assert first and second
     assert not (first & second), "commits must not claim the same changes"
 
 
-# --- the service -----------------------------------------------------------
-
-@pytest.fixture
-def client():
-    from service.app import app
-    app.config["TESTING"] = True
-    return app.test_client()
-
+# --- probes ----------------------------------------------------------------
 
 def test_health_is_cheap_and_always_ok(client):
-    body = client.get("/health").get_json()
+    body = client.get("/health").json()
     assert body["status"] == "ok"
     assert body["version"]
 
 
 def test_ready_reports_model_state(client):
-    body = client.get("/ready").get_json()
+    body = client.get("/ready").json()
     assert body["status"] == "ok"
     assert "configured" in body["model"]
 
+
+# --- analyze ---------------------------------------------------------------
 
 def test_analyze_endpoint_splits_a_real_diff(client, tangled):
     _, diff, contents = tangled
@@ -165,44 +172,110 @@ def test_analyze_endpoint_splits_a_real_diff(client, tangled):
         "diff": diff, "files": contents, "messages": False,
     })
     assert response.status_code == 200
-    body = response.get_json()
+    body = response.json()
     assert len(body["commits"]) == 2
     assert all(c["message"]["header"] for c in body["commits"])
-
-
-def test_analyze_rejects_a_missing_diff(client):
-    assert client.post("/analyze", json={}).status_code == 400
-
-
-def test_analyze_rejects_a_non_object_body(client):
-    assert client.post("/analyze", json=["nope"]).status_code == 400
-
-
-def test_analyze_rejects_bad_files_type(client, tangled):
-    _, diff, _ = tangled
-    response = client.post("/analyze", json={"diff": diff, "files": "not-a-dict"})
-    assert response.status_code == 400
-
-
-def test_analyze_rejects_an_oversized_diff(client):
-    import service.app as service
-    huge = "diff --git a/x b/x\n" + ("+x\n" * 10)
-    original = service.MAX_DIFF_BYTES
-    service.MAX_DIFF_BYTES = 10
-    try:
-        assert client.post("/analyze", json={"diff": huge}).status_code == 413
-    finally:
-        service.MAX_DIFF_BYTES = original
+    assert all(c["content_key"] for c in body["commits"])
 
 
 def test_analyze_works_without_file_contents(client, tangled):
     _, diff, _ = tangled
     response = client.post("/analyze", json={"diff": diff, "messages": False})
     assert response.status_code == 200
-    assert response.get_json()["commits"]
+    assert response.json()["commits"]
+
+
+def test_analyze_accepts_co_change_pairs(client, tangled):
+    _, diff, contents = tangled
+    response = client.post("/analyze", json={
+        "diff": diff,
+        "files": contents,
+        "co_change": [["app/auth.py", "app/routes.py", 0.9]],
+        "messages": False,
+    })
+    assert response.status_code == 200
+
+
+# --- validation, now handled by the schema ---------------------------------
+
+def test_missing_diff_is_rejected(client):
+    assert client.post("/analyze", json={}).status_code == 422
+
+
+def test_blank_diff_is_rejected(client):
+    assert client.post("/analyze", json={"diff": "   "}).status_code == 422
+
+
+def test_wrong_type_for_files_is_rejected(client, tangled):
+    _, diff, _ = tangled
+    response = client.post("/analyze", json={"diff": diff, "files": "not-a-dict"})
+    assert response.status_code == 422
+
+
+def test_malformed_co_change_is_rejected(client, tangled):
+    _, diff, _ = tangled
+    response = client.post("/analyze", json={
+        "diff": diff, "co_change": [["only-one-path"]],
+    })
+    assert response.status_code == 422
+
+
+def test_unknown_field_is_rejected(client, tangled):
+    """extra='forbid' turns a typo into an error instead of silence."""
+    _, diff, _ = tangled
+    response = client.post("/analyze", json={"diff": diff, "mesages": False})
+    assert response.status_code == 422
+
+
+def test_oversized_diff_is_rejected_with_413(client):
+    """Size limits stay distinct from schema errors."""
+    import app as service
+    original = service.MAX_DIFF_BYTES
+    service.MAX_DIFF_BYTES = 10
+    try:
+        response = client.post("/analyze", json={"diff": "diff --git a/x b/x\n+x\n"})
+        assert response.status_code == 413
+        assert "error" in response.json()
+    finally:
+        service.MAX_DIFF_BYTES = original
+
+
+def test_too_many_files_is_rejected_with_413(client, tangled):
+    _, diff, _ = tangled
+    import app as service
+    original = service.MAX_FILES
+    service.MAX_FILES = 1
+    try:
+        response = client.post("/analyze", json={
+            "diff": diff, "files": {"a.py": "x", "b.py": "y"},
+        })
+        assert response.status_code == 413
+    finally:
+        service.MAX_FILES = original
 
 
 def test_unknown_route_returns_json_not_html(client):
     response = client.get("/nope")
     assert response.status_code == 404
-    assert response.get_json()["error"]
+    assert response.headers["content-type"].startswith("application/json")
+
+
+# --- generated documentation ------------------------------------------------
+
+def test_openapi_document_is_generated(client):
+    """The schemas are the API docs. If this breaks, /docs is wrong too."""
+    spec = client.get("/openapi.json").json()
+    assert "/analyze" in spec["paths"]
+    assert "/health" in spec["paths"]
+    assert spec["info"]["title"] == "Commit Splitter"
+
+
+def test_analyze_is_documented_with_its_error_codes(client):
+    spec = client.get("/openapi.json").json()
+    responses = spec["paths"]["/analyze"]["post"]["responses"]
+    for code in ("200", "413", "422", "500"):
+        assert code in responses
+
+
+def test_docs_page_is_served(client):
+    assert client.get("/docs").status_code == 200

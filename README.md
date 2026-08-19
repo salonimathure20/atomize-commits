@@ -8,22 +8,22 @@ commits, and writes a Conventional Commits message for each.
 
 ## Status
 
-**Phase 3 complete — splits, orders, and names commits.**
+**Complete.** One engine, three ways to use it.
 
 | Phase | What it adds | State |
 |---|---|---|
 | 1 | Hunk parsing, partial staging, CLI | done |
 | 2 | Relatedness graph + clustering | done |
 | 3 | Dependency ordering + LLM commit messages | done |
-| 4 | FastAPI service + Docker | next |
-| 5 | VS Code extension | |
-| 6 | Kubernetes: verification jobs, HPA | |
-| 7 | Deploy, CI/CD, publish | |
+| 4 | FastAPI service + Docker | done |
+| 5 | VS Code extension | done |
+| 6 | CI check for pull requests | done |
 
 ## Quick start
 
 ```bash
 cd engine
+pip install networkx          # the only dependency
 
 # what changed, broken into hunks
 python3 -m splitter --repo ~/your-repo list -v
@@ -48,7 +48,14 @@ python3 -m splitter --repo ~/your-repo commit -m "feat(auth): ..." -H a784e4
 Hunks are addressed by a short content hash, a full id
 (`app/auth.py#a784e4`), or a file path meaning "every hunk in this file".
 
-Run the tests with `pip install -e '.[dev]'` then `python -m pytest tests -q`.
+Run everything with `make test`.
+
+| Suite | Tests | Covers |
+|---|---|---|
+| `engine/tests` | 39 | parsing, splitting, grouping, ordering, messages |
+| `service/tests` | 22 | the analysis core and the HTTP API |
+| `ci/tests` | 25 | the PR check, against a stub HTTP server |
+| `extension/test` | 37 | argument building, merging, HTML escaping |
 
 ## How the pieces fit
 
@@ -61,6 +68,8 @@ symbols.py    which function/class does a line live in? (regex today,
               tree-sitter later — swapping it touches only this file)
 features.py   builds a profile card per hunk
 grouping.py   scores every pair, builds the graph, runs Louvain
+core.py       the whole analysis with git removed; CLI and service both
+              call this, so they cannot drift apart
 ordering.py   sorts commits so nothing is used before it exists
 llm.py        pluggable model providers, stdlib HTTP only
 messages.py   Conventional Commits generation and validation
@@ -174,6 +183,117 @@ auth commit alone gives an ImportError.
 `ordering.py` builds a second graph — group A before group B whenever A
 introduces a name B uses — and topologically sorts it. Genuine cycles are
 reported and the weakest link broken, rather than failing.
+
+## Running as a service
+
+The engine assumed a checkout on local disk: run `git diff`, read files, mine
+`git log`. A web service has none of that, so `core.py` takes plain data in and
+gives plain data out. The CLI gathers that data from git; the service receives
+it in a request body. One implementation, two front doors.
+
+```bash
+make docker-run                    # build and start
+open http://localhost:8000/docs    # interactive API documentation
+
+curl localhost:8000/health
+curl localhost:8000/ready          # also reports model configuration
+
+curl -X POST localhost:8000/analyze \
+  -H 'Content-Type: application/json' \
+  -d "{\"diff\": $(git diff | jq -Rs .), \"messages\": false}"
+```
+
+FastAPI generates `/docs` from the Pydantic schemas in `service/schemas.py`,
+so the documentation cannot drift from the code — two tests assert the
+generated OpenAPI document contains the endpoints and their error codes.
+
+Request bodies are validated by the schema before the endpoint runs. A body
+of the wrong shape returns 422; a diff or file set that is too large returns
+413. Declaring response models too means FastAPI filters outgoing payloads to
+exactly those fields, so nothing internal can leak by accident.
+
+`POST /analyze` takes `diff` (required), `files` (optional map of path to
+current contents — improves symbol detection), `co_change` (optional, mined
+from the caller's history), and `messages` (optional bool).
+
+The service is stateless: it never clones a repo, writes to disk, or holds
+anything between requests. Any replica can answer any request, which is what
+makes scaling it trivial. It also never commits — applying commits needs your
+working tree and your git credentials, so that stays on your machine.
+
+**On privacy.** Sending a diff to a server means your code leaves your
+machine. That is why the whole thing ships as a container you can run
+yourself: `docker compose up` and the service is on your laptop.
+
+## Two products, one engine
+
+| | Where it runs | What it does |
+|---|---|---|
+| **VS Code extension** | your machine | Split changes *before* you commit |
+| **Pull request check** | GitHub Actions | Flag PRs that bundle unrelated changes |
+
+The extension calls the local Python directly. The PR check needs the
+container — a webhook has no laptop to shell out to, and CI gets a working
+engine without installing packages or pinning versions.
+
+## The pull request check
+
+On every pull request, the workflow builds the image, starts the service,
+sends it the PR's diff, and comments if the changes should have been several
+commits:
+
+> ### This pull request contains 2 unrelated changes
+>
+> **1. `feat(payments): add stripe charging`**
+> 3 files · +17 −0
+>
+> **2. `feat(auth): add JWT verification`**
+> 2 files · +13 −0
+
+Design decisions worth knowing:
+
+- **It never fails the build.** A tool that blocks merges over style gets
+  switched off in a week; one that leaves a useful comment gets read. Pass
+  `--fail-over N` if you want it strict.
+- **It edits its own comment** rather than posting a new one per push, and
+  deletes it once the PR becomes one coherent change.
+- **A broken analysis is not a broken build.** If the service is unreachable,
+  the check logs a warning and exits zero.
+- **`base...head`, not `base..head`** — three dots compares against the merge
+  base, so commits that landed on the base branch after the PR opened are not
+  blamed on the author.
+
+Try it locally:
+
+```bash
+python3 ci/hygiene.py --service http://localhost:8000 \
+    --base main --head HEAD --dry-run
+```
+
+## The editor extension
+
+`extension/` is a VS Code extension in plain JavaScript — no build step, so
+there is no compiler between you and a working plugin.
+
+```bash
+cd extension
+npm test          # 37 tests, zero dependencies
+code .            # then press F5 to launch it
+```
+
+It is a thin client by design: it runs `python -m splitter plan`, renders the
+JSON, lets you edit messages and merge commits, then sends the reviewed plan
+back to `python -m splitter apply --plan`. No analysis is reimplemented in
+JavaScript, so everything interesting stays covered by the Python tests.
+
+Two decisions worth knowing about:
+
+- The plan travels to Python through a **temp file, not the command line**.
+  Commit messages are arbitrary user text, and putting that on a command line
+  is how quoting bugs and injection problems begin.
+- Everything rendered in the panel is **HTML-escaped**. The strings shown are
+  source code the user just wrote, so they are full of angle brackets and
+  quotes; five tests cover this specifically.
 
 ## Known limits
 

@@ -3,9 +3,18 @@
 test:            ## run every test
 	cd engine && python -m pytest tests -q
 	python -m pytest service/tests -q
+	python -m pytest ci/tests -q
+	cd extension && npm test
 
-serve:           ## run the service locally, no container
-	cd service && PYTHONPATH=../engine python app.py
+hygiene:         ## run the PR check against a locally running service
+	python3 ci/hygiene.py --service http://localhost:8000 \
+		--base $(BASE) --head HEAD --dry-run
+
+serve:           ## run the service locally with auto-reload
+	cd service && PYTHONPATH=../engine RELOAD=1 python app.py
+
+docs:            ## open the generated API documentation
+	@echo 'Start the service, then visit http://localhost:8000/docs'
 
 docker-build:    ## build the image
 	docker build -t commit-splitter:local .

@@ -1,0 +1,122 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  engine:
+    name: Engine (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The lowest version we claim to support, and the newest. If both pass,
+        # everything between almost certainly does.
+        python: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install
+        run: pip install networkx pytest
+
+      - name: Test
+        working-directory: engine
+        run: python -m pytest tests -q
+
+      - name: Check the tool on its own repository
+        # The engine must survive a real repository, not only the fixtures.
+        run: |
+          cd engine
+          python -m splitter --repo .. verify
+
+  service:
+    name: Service
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: pip install -r service/requirements-dev.txt
+
+      - name: Test
+        run: python -m pytest service/tests -q
+
+  ci-client:
+    name: CI client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: pip install pytest
+
+      - name: Test
+        run: python -m pytest ci/tests -q
+
+  extension:
+    name: VS Code extension
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Syntax check
+        working-directory: extension
+        run: npm run lint
+
+      - name: Test
+        working-directory: extension
+        run: npm test
+
+  image:
+    name: Container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: docker build -t commit-splitter:ci .
+
+      - name: Start it and check the probes
+        run: |
+          docker run -d --name splitter -p 8000:8000 commit-splitter:ci
+          for attempt in $(seq 1 30); do
+            curl -fsS http://localhost:8000/health > /dev/null && break
+            sleep 1
+          done
+          curl -fsS http://localhost:8000/health
+          curl -fsS http://localhost:8000/ready
+          # The generated documentation is part of the contract, so prove it exists.
+          curl -fsS http://localhost:8000/openapi.json | head -c 200
+
+      - name: Logs on failure
+        if: failure()
+        run: docker logs splitter
+
+      - name: Clean up
+        if: always()
+        run: docker rm -f splitter || true
