@@ -17,6 +17,9 @@ import sys
 from .features import build_features
 from .gitrepo import GitError, Repo
 from .grouping import build_graph, cluster, co_change_matrix, explain_group
+from .llm import LLMError, provider_from_env
+from .messages import generate as generate_messages
+from .ordering import missing_references, order_groups
 from .parser import all_hunks, parse_diff
 from .subhunks import split_all
 from .patch import build_patch, resolve_ids, selection_stat
@@ -137,34 +140,49 @@ def _plan(repo: Repo, use_history: bool):
     return files, profiles, cluster(graph), edges
 
 
-def _heuristic_message(members) -> str:
-    """A placeholder commit message until Phase 3 brings in the model.
+def _prepare(repo: Repo, use_history: bool, use_model: bool):
+    """Group, order, and name the commits. Returns (plan, warnings).
 
-    Conventional Commits shape: type(scope): summary. We guess the scope from
-    the shared directory or filename and the type from whether the group looks
-    like new code, tests, or edits.
+    A plan entry is (message, content-key set, members).
     """
-    paths = {m.path for m in members}
-    dirs = {m.directory for m in members}
-    scope = next(iter(dirs)).split("/")[-1] if len(dirs) == 1 else "core"
-    if scope in (".", ""):
-        scope = "core"
+    warnings: list[str] = []
+    _, profiles, groups, _ = _plan(repo, use_history)
+    if not groups:
+        return [], warnings
 
-    only_tests = all(m.is_test for m in members)
-    adds = sum(m.hunk.stat[0] for m in members)
-    dels = sum(m.hunk.stat[1] for m in members)
+    by_id = {p.hunk_id: p for p in profiles}
+    member_groups = [[by_id[hid] for hid in g] for g in groups]
 
-    kind = "test" if only_tests else ("feat" if dels == 0 else "refactor")
-    names = sorted({s for m in members for s in m.defines})
-    if names:
-        subject = f"add {', '.join(names[:3])}"
-    else:
-        subject = f"update {', '.join(sorted(paths)[:2])}"
-    return f"{kind}({scope}): {subject}"
+    # 1. Order so that a commit never uses something a later commit creates.
+    order, cycle_warnings = order_groups(member_groups)
+    warnings.extend(cycle_warnings)
+    member_groups = [member_groups[i] for i in order]
+
+    for index, dangling in missing_references(member_groups):
+        names = ", ".join(sorted(dangling)[:3])
+        warnings.append(f"commit {index + 1} references {names} before it exists")
+
+    # 2. Name them.
+    provider = None
+    if use_model:
+        try:
+            provider = provider_from_env()
+        except LLMError as exc:
+            warnings.append(str(exc))
+    messages, message_warning = generate_messages(member_groups, provider)
+    if message_warning:
+        warnings.append(message_warning)
+
+    from .patch import content_key
+    plan = []
+    for message, members in zip(messages, member_groups):
+        wanted = frozenset().union(*(content_key(m.hunk) for m in members))
+        plan.append((message, wanted, members))
+    return plan, warnings
 
 
 def cmd_apply(args) -> int:
-    """Compute a split and commit every group, in one pass.
+    """Compute a split and commit every group, in dependency order.
 
     Doing this in a single run matters: after each commit the diff is
     regenerated and hunk ids change, so we re-resolve each remaining group by
@@ -175,48 +193,105 @@ def cmd_apply(args) -> int:
         print("Index is not clean. Unstage first (git reset).", file=sys.stderr)
         return 2
 
-    _, profiles, groups, _ = _plan(repo, not args.no_history)
-    if not groups:
+    plan, warnings = _prepare(repo, not args.no_history, not args.no_model)
+    if not plan:
         print("Nothing to commit.")
         return 0
 
-    by_id = {p.hunk_id: p for p in profiles}
-    from .patch import content_key, match_by_content
-
-    plan = []
-    for group in groups:
-        members = [by_id[hid] for hid in group]
-        wanted = frozenset().union(*(content_key(m.hunk) for m in members))
-        plan.append((_heuristic_message(members), wanted, members))
+    for warning in warnings:
+        print(f"note: {warning}", file=sys.stderr)
 
     if args.dry_run:
-        for message, _, members in plan:
-            print(f"\n{message}")
+        for n, (message, _, members) in enumerate(plan, start=1):
+            print(f"\n[{n}] {message.header()}   ({message.generated_by})")
+            if message.body:
+                print(f"      {message.body}")
             for m in sorted(members, key=lambda x: x.path):
-                print(f"    {m.label()}")
+                print(f"      {m.label()}")
         return 0
 
-    for n, (message, wanted, members) in enumerate(plan, start=1):
+    from .patch import match_by_content
+    for n, (message, wanted, _) in enumerate(plan, start=1):
         files = load(repo)                      # fresh view after each commit
         selected = match_by_content(files, wanted)
         if not selected:
             print(f"[{n}] nothing left to match; skipping", file=sys.stderr)
             continue
 
-        patch = build_patch(files, selected)
         try:
-            repo.apply_cached(patch)
+            repo.apply_cached(build_patch(files, selected))
         except GitError as exc:
             print(f"[{n}] failed to stage:\n{exc}", file=sys.stderr)
             repo.reset_index()
             return 1
 
-        sha = repo.commit(message)
-        print(f"{sha}  {message}")
+        sha = repo.commit(message.full())
+        print(f"{sha}  {message.header()}")
 
     leftover = all_hunks(load(repo))
     if leftover:
         print(f"\n{len(leftover)} hunk(s) left unassigned; run `list` to see them.")
+    return 0
+
+
+def cmd_doctor(args) -> int:
+    """Check whether the configured model is reachable, before you need it.
+
+    Setup problems (unset key, Ollama not running, wrong model name) otherwise
+    only surface as a quiet fallback to heuristic messages, which is easy to
+    miss. This makes them loud.
+    """
+    import os
+
+    choice = os.environ.get("SPLITTER_LLM", "").strip().lower() or "(unset)"
+    print(f"SPLITTER_LLM = {choice}")
+
+    try:
+        provider = provider_from_env()
+    except LLMError as exc:
+        print(f"  config error: {exc}")
+        return 1
+
+    if provider is None:
+        print("  no model configured — heuristic messages will be used")
+        print("  set SPLITTER_LLM to ollama, gemini, anthropic, or openai")
+        return 0
+
+    model = getattr(provider, "model", "?")
+    print(f"provider     = {provider.name}")
+    print(f"model        = {model}")
+    print("sending a test prompt...")
+
+    try:
+        reply = provider.complete(
+            "Reply with exactly one word.",
+            "Say the word: ready",
+        )
+    except LLMError as exc:
+        message = str(exc)
+        print(f"  FAILED: {message}")
+
+        # Providers retire model names regularly, and the error usually names
+        # the replacement. Surface that instead of making the user read JSON.
+        if "404" in message or "not found" in message.lower():
+            import re
+            suggestion = re.search(r"models/([\w.\-]+) for the latest", message)
+            print(f"  the model name {model!r} looks retired")
+            if suggestion:
+                print(f"  the provider suggests: {suggestion.group(1)}")
+                print(f"  fix with:  export SPLITTER_MODEL={suggestion.group(1)}")
+            else:
+                print("  set a current one with:  export SPLITTER_MODEL=<name>")
+        elif "401" in message or "403" in message or "API_KEY" in message:
+            print("  the key looks wrong or expired; create a new one")
+        elif provider.name == "ollama":
+            print("  is ollama running? try:  ollama serve")
+            print(f"  is the model pulled? try:  ollama pull {model}")
+        return 1
+
+    snippet = " ".join(reply.split())[:60]
+    print(f"  reply: {snippet!r}")
+    print("  model is reachable")
     return 0
 
 
@@ -297,7 +372,12 @@ def main(argv: list[str] | None = None) -> int:
     p_apply.add_argument("--no-history", action="store_true")
     p_apply.add_argument("--dry-run", action="store_true",
                          help="show the plan without committing")
+    p_apply.add_argument("--no-model", action="store_true",
+                         help="skip the language model, use heuristic messages")
     p_apply.set_defaults(func=cmd_apply)
+
+    p_doctor = sub.add_parser("doctor", help="check the model configuration")
+    p_doctor.set_defaults(func=cmd_doctor)
 
     p_why = sub.add_parser("why", help="show pairwise relatedness scores")
     p_why.add_argument("--no-history", action="store_true")

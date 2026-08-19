@@ -8,14 +8,14 @@ commits, and writes a Conventional Commits message for each.
 
 ## Status
 
-**Phase 1 complete — mechanical foundation, no intelligence yet.**
+**Phase 3 complete — splits, orders, and names commits.**
 
 | Phase | What it adds | State |
 |---|---|---|
 | 1 | Hunk parsing, partial staging, CLI | done |
 | 2 | Relatedness graph + clustering | done |
-| 3 | LLM refinement and message generation | next |
-| 4 | FastAPI service + Docker | |
+| 3 | Dependency ordering + LLM commit messages | done |
+| 4 | FastAPI service + Docker | next |
 | 5 | VS Code extension | |
 | 6 | Kubernetes: verification jobs, HPA | |
 | 7 | Deploy, CI/CD, publish | |
@@ -61,6 +61,9 @@ symbols.py    which function/class does a line live in? (regex today,
               tree-sitter later — swapping it touches only this file)
 features.py   builds a profile card per hunk
 grouping.py   scores every pair, builds the graph, runs Louvain
+ordering.py   sorts commits so nothing is used before it exists
+llm.py        pluggable model providers, stdlib HTTP only
+messages.py   Conventional Commits generation and validation
 patch.py      a subset of hunks  ->  patch text git will accept
 cli.py        list / verify / group / why / apply / commit
 ```
@@ -100,13 +103,80 @@ offset   += (new_count - old_count)   # advances only for included hunks
 `test_skipping_middle_hunk_lands_correctly` is the regression test for this.
 If you change `patch.py`, run it.
 
+## Commit messages
+
+Messages come from a language model when one is configured, and from
+structural heuristics otherwise. The tool works fully offline; the model is an
+upgrade, never a requirement.
+
+```bash
+# free and private: a model on your own machine
+export SPLITTER_LLM=ollama
+export SPLITTER_MODEL=qwen2.5-coder:7b
+
+# or bring your own key
+export SPLITTER_LLM=gemini      && export GEMINI_API_KEY=...
+export SPLITTER_LLM=anthropic   && export ANTHROPIC_API_KEY=...
+export SPLITTER_LLM=openai      && export OPENAI_API_KEY=...
+
+# or turn it off entirely
+export SPLITTER_LLM=none
+```
+
+Check your setup before relying on it — a misconfigured model fails quietly by
+falling back to heuristics, which is easy to miss:
+
+```bash
+python3 -m splitter --repo . doctor
+```
+
+`doctor` reads the provider's own error back to you — retired model names,
+rejected keys, and an unreachable Ollama each get a specific fix rather than a
+stack trace.
+
+**On credentials.** Keys are read from the environment and never written to
+disk. The Gemini key travels as a request header rather than a query string,
+because query strings end up in shell history and proxy logs. Anything that
+looks like a credential is masked before it reaches a terminal or an error
+message — see `redact()` in `llm.py` and its tests.
+
+**Model names go stale.** Providers retire them every few months. If a
+default stops working, override it rather than editing the code:
+
+```bash
+export SPLITTER_MODEL=gemini-3.6-flash
+```
+
+## See it work
+
+`demo.sh` rebuilds a repo where payments and authentication were edited into
+the same file, then shows the grouping, the heuristic messages, and your
+model's messages side by side.
+
+```bash
+cd engine
+./demo.sh                # rebuild and show the plan
+./demo.sh --commit       # ...and make the commits, with safety checks
+```
+
+Every reply is validated against Conventional Commits before use: unknown
+types, empty subjects, trailing periods, and over-long headers are rejected or
+repaired, and anything unusable falls back to the heuristic message. The model
+never sees the whole diff — only a compact summary of each proposed commit,
+which keeps calls small and cheap.
+
+## Commit ordering
+
+Grouping says *what* belongs together; it says nothing about *when*. If the
+auth commit imports something the payments commit creates, checking out the
+auth commit alone gives an ImportError.
+
+`ordering.py` builds a second graph — group A before group B whenever A
+introduces a name B uses — and topologically sorts it. Genuine cycles are
+reported and the weakest link broken, rather than failing.
+
 ## Known limits
 
-- **Import blocks travel as one unit.** `from .auth import ...` and
-  `from .payments import ...` sit on adjacent lines, so git emits them as a
-  single hunk and both land in whichever commit runs first. Covered by the
-  xfail test `test_import_lines_follow_their_feature`. Fixing it needs
-  line-level splitting of import regions.
 - **Mixed add/remove hunks are never split.** `subhunks.py` only cuts runs of
   pure additions, because reasoning about interleaved deletions is where
   correctness bugs live.

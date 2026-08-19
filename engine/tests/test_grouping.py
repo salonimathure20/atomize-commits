@@ -196,13 +196,12 @@ def test_tangled_file_splits_by_feature(repo: Path):
     assert "charge_card" not in auth_group
 
 
-@pytest.mark.xfail(reason="known limit: the import block is a single hunk")
 def test_import_lines_follow_their_feature(repo: Path):
-    """Documented gap.
+    """Each import must land with the feature that uses the name it brings in.
 
-    `from .auth import ...` and `from .payments import ...` sit on adjacent
-    lines, so git emits them as one hunk and both land in whichever commit
-    goes first. Fixing this needs line-level splitting of import blocks.
+    This used to fail: `from .auth import ...` and `from .payments import ...`
+    are adjacent lines, so git emitted them as one inseparable hunk. Import
+    splitting in subhunks.py fixed it.
     """
     tangle(repo)
     _, files = load(repo)

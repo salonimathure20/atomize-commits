@@ -31,10 +31,18 @@ they are rarer in practice.
 
 from __future__ import annotations
 
+import re
+
 from .models import FileDiff, Hunk
 from .symbols import DEFINITION_PATTERNS
 
-MIN_RUN = 4          # do not bother splitting tiny insertions
+MIN_RUN = 4          # do not bother splitting tiny runs of added code
+
+# Import statements across the languages we care about.
+IMPORT_LINE = re.compile(
+    r"^\s*(?:import\s|from\s+\S+\s+import\s|#include\s|use\s+\S+;"
+    r"|(?:const|let|var)\s+\{?[\w\s,}]+\}?\s*=\s*require\()"
+)
 
 
 def _definition_indent(line: str) -> int | None:
@@ -75,6 +83,22 @@ def _cut_points(added: list[str]) -> list[int]:
     return sorted(set(adjusted))
 
 
+def _import_cut_points(added: list[str]) -> list[int]:
+    """Cut an import block into one piece per import statement.
+
+    Imports are the worst case for proximity-based hunking: two imports for
+    two completely unrelated features sit on adjacent lines, so git hands
+    them over as one inseparable unit. Once they are split, the ordinary
+    scoring attaches each import to whichever feature actually uses the name
+    it brings in.
+    """
+    starts = [i for i, ln in enumerate(added) if IMPORT_LINE.match(ln)]
+    if len(starts) < 2:
+        return []
+    starts[0] = 0
+    return sorted(set(starts))
+
+
 def split_hunk(hunk: Hunk) -> list[Hunk]:
     """Return one or more hunks. Returns [hunk] when no split applies."""
     body = hunk.lines
@@ -107,15 +131,20 @@ def split_hunk(hunk: Hunk) -> list[Hunk]:
         runs.append((run_start, len(body), run_old, run_new))
 
     # Only split when exactly one run dominates and it has cut points.
-    candidates = [r for r in runs if r[1] - r[0] >= MIN_RUN]
-    if len(candidates) != 1 or len(runs) != len(candidates):
+    if len(runs) != 1:
         return [hunk]
     if any(ln.startswith("-") for ln in body):
         return [hunk]                      # mixed hunk: too risky, keep whole
 
-    start, end, old_at, new_at = candidates[0]
+    start, end, old_at, new_at = runs[0]
     added = [ln[1:] for ln in body[start:end]]
-    cuts = _cut_points(added)
+
+    # Try definition boundaries first, then import boundaries. Definitions
+    # need a run of some size; imports do not, because two adjacent import
+    # lines are already the problem.
+    cuts = _cut_points(added) if (end - start) >= MIN_RUN else []
+    if len(cuts) < 2:
+        cuts = _import_cut_points(added)
     if len(cuts) < 2:
         return [hunk]
 
