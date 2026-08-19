@@ -10,15 +10,15 @@ commits, and writes a Conventional Commits message for each.
 
 **Phase 1 complete — mechanical foundation, no intelligence yet.**
 
-| Phase | What it adds | State |
-|---|---|---|
-| 1 | Hunk parsing, partial staging, CLI | done |
-| 2 | Relatedness graph + clustering | next |
-| 3 | LLM refinement and message generation | |
-| 4 | FastAPI service + Docker | |
-| 5 | VS Code extension | |
-| 6 | Kubernetes: verification jobs, HPA | |
-| 7 | Deploy, CI/CD, publish | |
+| Phase | What it adds                          | State |
+| ----- | ------------------------------------- | ----- |
+| 1     | Hunk parsing, partial staging, CLI    | done  |
+| 2     | Relatedness graph + clustering        | next  |
+| 3     | LLM refinement and message generation |       |
+| 4     | FastAPI service + Docker              |       |
+| 5     | VS Code extension                     |       |
+| 6     | Kubernetes: verification jobs, HPA    |       |
+| 7     | Deploy, CI/CD, publish                |       |
 
 ## Quick start
 
