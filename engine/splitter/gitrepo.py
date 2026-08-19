@@ -45,9 +45,14 @@ class Repo:
         return [p for p in out.splitlines() if p.strip()]
 
     def index_is_clean(self) -> bool:
-        """True when nothing is staged. We require this before committing."""
+        """True when nothing is staged.
+
+        `--ita-invisible-in-index` makes git ignore intent-to-add markers. We
+        create those ourselves so untracked files show up in diffs, and they
+        would otherwise make a perfectly clean index look dirty.
+        """
         proc = subprocess.run(
-            ["git", "diff", "--cached", "--quiet"],
+            ["git", "diff", "--cached", "--ita-invisible-in-index", "--quiet"],
             cwd=self.root, capture_output=True, text=True,
         )
         return proc.returncode == 0

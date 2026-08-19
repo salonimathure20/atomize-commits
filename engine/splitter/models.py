@@ -46,6 +46,21 @@ class Hunk:
         """(additions, deletions) — handy for summaries."""
         return len(self.added_lines), len(self.removed_lines)
 
+    @property
+    def first_changed_line(self) -> int:
+        """New-side line number of the first real change.
+
+        A hunk starts with context lines, so `new_start` can point at code
+        that belongs to the *previous* function. Asking "which function am I
+        in?" at new_start therefore gives the wrong answer. Use this instead.
+        """
+        line = self.new_start
+        for raw in self.lines:
+            if raw.startswith(("+", "-")):
+                return line
+            line += 1
+        return self.new_start
+
     def header(self, new_start: int | None = None) -> str:
         """Rebuild the @@ line, optionally overriding the new-side start.
 
