@@ -21,6 +21,7 @@ a slightly wrong order is far more useful than a refusal.
 from __future__ import annotations
 
 from .features import HunkFeatures
+from .graphs import topological_order
 
 
 def _group_names(members: list[HunkFeatures]) -> tuple[set[str], set[str]]:
@@ -55,29 +56,15 @@ def order_groups(groups: list[list[HunkFeatures]]) -> tuple[list[int], list[str]
     Uses Kahn's algorithm: repeatedly take any group with nothing left waiting
     on it. Ties are broken by original position so results stay reproducible.
     """
-    import networkx as nx
-
-    n = len(groups)
     warnings: list[str] = []
-    graph = nx.DiGraph()
-    graph.add_nodes_from(range(n))
+    order, dropped = topological_order(len(groups), dependency_edges(groups))
 
-    for before, after, strength in dependency_edges(groups):
-        graph.add_edge(before, after, strength=strength)
-
-    while True:
-        try:
-            cycle = nx.find_cycle(graph, orientation="original")
-        except nx.NetworkXNoCycle:
-            break
-        weakest = min(cycle, key=lambda e: graph[e[0]][e[1]]["strength"])
-        graph.remove_edge(weakest[0], weakest[1])
+    for before, after in dropped:
         warnings.append(
-            f"commits {weakest[0] + 1} and {weakest[1] + 1} depend on each "
+            f"commits {before + 1} and {after + 1} depend on each "
             "other; order between them is a guess"
         )
 
-    order = list(nx.lexicographical_topological_sort(graph))
     return order, warnings
 
 

@@ -4,7 +4,11 @@ test:            ## run every test
 	cd engine && python -m pytest tests -q
 	python -m pytest service/tests -q
 	python -m pytest ci/tests -q
+	python -m pytest eval/tests -q
 	cd extension && npm test
+
+eval:            ## measure recovery of real commit boundaries
+	python eval/recover.py --repo $(REPO) --windows 30 --compare
 
 hygiene:         ## run the PR check against a locally running service
 	python3 ci/hygiene.py --service http://localhost:8000 \

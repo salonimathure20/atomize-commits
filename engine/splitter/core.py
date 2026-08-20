@@ -107,6 +107,7 @@ def analyze(
     source: Source | None = None,
     co_change: dict[tuple[str, str], float] | None = None,
     provider: Provider | None = None,
+    algorithm: str = "louvain",
 ) -> Analysis:
     """Split a diff into proposed commits, ordered and named.
 
@@ -115,6 +116,7 @@ def analyze(
                analysis simply gets coarser without it
     co_change  file pairs that historically change together; optional
     provider   a language model for commit messages; optional
+    algorithm  community detection method; see eval/ for the comparison
     """
     source = source or empty_source()
     warnings: list[str] = []
@@ -127,7 +129,7 @@ def analyze(
         return Analysis(warnings=warnings, unsplittable=unsplittable)
 
     graph, edges = build_graph(profiles, co_change or {})
-    groups = cluster(graph)
+    groups = cluster(graph, algorithm)
 
     by_id = {p.hunk_id: p for p in profiles}
     member_groups = [[by_id[hid] for hid in g] for g in groups]

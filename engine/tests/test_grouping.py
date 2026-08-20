@@ -216,3 +216,140 @@ def test_import_lines_follow_their_feature(repo: Path):
         )
         if "import verify_token" in text:
             assert "charge_card" not in text
+
+
+# --- the graph algorithms themselves ---------------------------------------
+
+def test_two_disconnected_clusters_are_found():
+    from splitter.graphs import Graph, communities
+
+    g = Graph()
+    for a, b in [("a1", "a2"), ("a2", "a3"), ("a1", "a3")]:
+        g.add_edge(a, b, 0.9)
+    for a, b in [("b1", "b2"), ("b2", "b3"), ("b1", "b3")]:
+        g.add_edge(a, b, 0.9)
+
+    groups = communities(g)
+    assert len(groups) == 2
+    assert {"a1", "a2", "a3"} in [set(x) for x in groups]
+
+
+def test_an_isolated_node_gets_its_own_group():
+    """A hunk related to nothing deserves its own commit."""
+    from splitter.graphs import Graph, communities
+
+    g = Graph()
+    g.add_edge("a1", "a2", 0.9)
+    g.add_node("lonely")
+    groups = communities(g)
+    assert ["lonely"] in groups
+
+
+def test_clustering_is_deterministic():
+    """A tool that proposes a different split each run is not trustworthy."""
+    from splitter.graphs import Graph, communities
+
+    def build():
+        g = Graph()
+        for a, b, w in [("a", "b", 0.9), ("b", "c", 0.8), ("d", "e", 0.7)]:
+            g.add_edge(a, b if b else b, w)
+        return g
+
+    g1, g2 = Graph(), Graph()
+    for g in (g1, g2):
+        for a, b, w in [("a", "b", 0.9), ("b", "c", 0.8), ("d", "e", 0.7)]:
+            g.add_edge(a, b, w)
+    assert communities(g1) == communities(g2)
+
+
+def test_a_weak_bridge_does_not_merge_two_clusters():
+    from splitter.graphs import Graph, communities
+
+    g = Graph()
+    for a, b in [("a1", "a2"), ("a2", "a3"), ("a1", "a3")]:
+        g.add_edge(a, b, 0.95)
+    for a, b in [("b1", "b2"), ("b2", "b3"), ("b1", "b3")]:
+        g.add_edge(a, b, 0.95)
+    g.add_edge("a1", "b1", 0.36)      # barely over the threshold
+
+    assert len(communities(g)) == 2
+
+
+def test_topological_order_respects_dependencies():
+    from splitter.graphs import topological_order
+
+    order, dropped = topological_order(3, [(2, 0, 1), (0, 1, 1)])
+    assert order.index(2) < order.index(0) < order.index(1)
+    assert dropped == []
+
+
+def test_topological_order_is_stable_without_edges():
+    from splitter.graphs import topological_order
+
+    order, dropped = topological_order(4, [])
+    assert order == [0, 1, 2, 3]
+    assert dropped == []
+
+
+def test_a_cycle_drops_its_weakest_edge_rather_than_failing():
+    from splitter.graphs import topological_order
+
+    order, dropped = topological_order(2, [(0, 1, 5), (1, 0, 1)])
+    assert sorted(order) == [0, 1]
+    assert dropped == [(1, 0)], "the weaker edge is the one to lose"
+
+
+def test_louvain_beats_label_propagation_on_a_strong_bridge():
+    """The reason Louvain is the default.
+
+    Label propagation is purely local, so a single strong edge between two
+    dense clusters drags them into one community. Louvain optimises a global
+    modularity score and keeps them apart.
+    """
+    from splitter.graphs import Graph, label_propagation, louvain, modularity
+
+    g = Graph()
+    for a, b in [("a1", "a2"), ("a2", "a3"), ("a1", "a3")]:
+        g.add_edge(a, b, 0.9)
+    for a, b in [("b1", "b2"), ("b2", "b3"), ("b1", "b3")]:
+        g.add_edge(a, b, 0.9)
+    g.add_edge("a1", "b1", 0.9)
+
+    assert len(louvain(g)) == 2
+    assert len(label_propagation(g)) == 1
+    assert modularity(g, louvain(g)) > modularity(g, label_propagation(g))
+
+
+def test_modularity_of_a_pointless_grouping_is_about_zero():
+    from splitter.graphs import Graph, modularity
+
+    g = Graph()
+    for a, b in [("a", "b"), ("b", "c"), ("c", "d")]:
+        g.add_edge(a, b, 1.0)
+    assert abs(modularity(g, [["a", "b", "c", "d"]])) < 0.01
+
+
+def test_louvain_is_deterministic():
+    from splitter.graphs import Graph, louvain
+
+    def build():
+        g = Graph()
+        for a, b, w in [("a", "b", .9), ("b", "c", .8), ("c", "a", .7),
+                        ("d", "e", .9), ("e", "f", .8), ("a", "d", .4)]:
+            g.add_edge(a, b, w)
+        return g
+
+    assert louvain(build()) == louvain(build())
+
+
+def test_unknown_algorithm_is_rejected():
+    from splitter.graphs import Graph, communities
+
+    g = Graph()
+    g.add_edge("a", "b", 1.0)
+    try:
+        communities(g, "magic")
+    except ValueError as exc:
+        assert "magic" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")

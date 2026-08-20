@@ -1,0 +1,106 @@
+{
+  "name": "atomize-commits",
+  "displayName": "Atomize Commits",
+  "description": "Splits tangled changes into separate, well-described commits with Conventional Commits messages.",
+  "version": "0.1.0",
+  "publisher": "salonimathure",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/salonimathure20/auto-commit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/salonimathure20/auto-commit/issues"
+  },
+  "galleryBanner": {
+    "color": "#1e1e2e",
+    "theme": "dark"
+  },
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "SCM Providers",
+    "Other"
+  ],
+  "keywords": [
+    "git",
+    "commit",
+    "conventional commits",
+    "ai"
+  ],
+  "activationEvents": [],
+  "main": "./src/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "commitSplitter.review",
+        "title": "Split Changes into Commits",
+        "category": "Commit Splitter",
+        "icon": "$(git-commit)"
+      },
+      {
+        "command": "commitSplitter.doctor",
+        "title": "Check Model Configuration",
+        "category": "Commit Splitter"
+      }
+    ],
+    "menus": {
+      "scm/title": [
+        {
+          "command": "commitSplitter.review",
+          "group": "navigation",
+          "when": "scmProvider == git"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Commit Splitter",
+      "properties": {
+        "commitSplitter.pythonPath": {
+          "type": "string",
+          "default": "python3",
+          "description": "Python interpreter that can import the splitter package. Use the absolute path to your virtual environment's python if you made one."
+        },
+        "commitSplitter.enginePath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the engine folder containing the splitter package. Leave blank to search the workspace."
+        },
+        "commitSplitter.provider": {
+          "type": "string",
+          "enum": [
+            "none",
+            "ollama",
+            "gemini",
+            "anthropic",
+            "openai"
+          ],
+          "default": "none",
+          "description": "Which model writes the commit messages. 'none' uses structural heuristics and never leaves your machine."
+        },
+        "commitSplitter.model": {
+          "type": "string",
+          "default": "",
+          "description": "Override the provider's default model name."
+        },
+        "commitSplitter.useHistory": {
+          "type": "boolean",
+          "default": true,
+          "description": "Mine git log for files that habitually change together."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "lint": "node --check src/extension.js && node --check src/planner.js && node --check src/panel.js",
+    "test": "node --test test/*.test.js",
+    "bundle": "rm -rf engine && mkdir -p engine && cp -R ../engine/splitter engine/splitter && find engine -name __pycache__ -type d -exec rm -rf {} +",
+    "package": "npm run bundle && npx @vscode/vsce package",
+    "publish": "npm run bundle && npx @vscode/vsce publish"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0"
+  }
+}

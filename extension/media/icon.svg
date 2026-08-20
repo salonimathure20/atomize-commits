@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <title>Commit Splitter</title>
+  <desc>A single tangled commit forking into two clean, separate commits.</desc>
+
+  <!-- Dark rounded tile: reads clearly on both light and dark Marketplace themes -->
+  <rect width="128" height="128" rx="28" fill="#1E1E2E"/>
+
+  <g stroke-linecap="round" fill="none">
+    <!-- The tangled commit coming in: one line, two colours overlaid, because
+         two features are mixed together inside it -->
+    <path d="M64 20 L64 50" stroke="#7F77DD" stroke-width="9"/>
+    <path d="M64 20 L64 50" stroke="#2BB598" stroke-width="9"
+          stroke-dasharray="6 6" stroke-dashoffset="3"/>
+
+    <!-- The split: one path becomes two, each a single clean colour -->
+    <path d="M64 50 C64 68, 36 64, 36 84" stroke="#7F77DD" stroke-width="9"/>
+    <path d="M64 50 C64 68, 92 64, 92 84" stroke="#2BB598" stroke-width="9"/>
+  </g>
+
+  <!-- Commit nodes. The top one is mixed; the two below are each one feature. -->
+  <circle cx="64" cy="24" r="11" fill="#1E1E2E" stroke="#7F77DD" stroke-width="7"/>
+  <path d="M64 13 A11 11 0 0 1 64 35" fill="none" stroke="#2BB598" stroke-width="7"/>
+
+  <circle cx="36" cy="97" r="12" fill="#7F77DD"/>
+  <circle cx="92" cy="97" r="12" fill="#2BB598"/>
+</svg>

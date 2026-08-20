@@ -17,6 +17,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 from .features import HunkFeatures
+from .graphs import Graph, communities
 
 WEIGHTS = {
     "same_symbol": 0.60,     # both edit the same function -> almost certainly one commit
@@ -111,10 +112,8 @@ def build_graph(
     profiles: list[HunkFeatures],
     co_change: dict[tuple[str, str], float] | None = None,
 ):
-    """Build a weighted graph. Returns (networkx graph, list of Edge)."""
-    import networkx as nx
-
-    graph = nx.Graph()
+    """Build a weighted graph. Returns (graph, list of Edge)."""
+    graph = Graph()
     edges: list[Edge] = []
 
     for profile in profiles:
@@ -130,7 +129,7 @@ def build_graph(
     return graph, edges
 
 
-def cluster(graph) -> list[list[str]]:
+def cluster(graph, algorithm: str = "louvain") -> list[list[str]]:
     """Find the tight bundles.
 
     Louvain repeatedly moves nodes between groups, keeping any move that makes
@@ -138,17 +137,11 @@ def cluster(graph) -> list[list[str]]:
     picks the number of groups by itself, which is what we want — we do not
     know in advance how many features got tangled together.
     """
-    import networkx as nx
-
     if graph.number_of_nodes() == 0:
         return []
     if graph.number_of_edges() == 0:
         return [[n] for n in graph.nodes()]
-
-    communities = nx.community.louvain_communities(graph, weight="weight", seed=7)
-    groups = [sorted(c) for c in communities]
-    groups.sort(key=lambda g: (-len(g), g[0]))
-    return groups
+    return communities(graph, algorithm)
 
 
 def explain_group(
