@@ -1,372 +1,198 @@
-# commit-splitter
+# Atomize Commits
 
-Splits a tangled working tree into atomic, well-described commits.
+Splits a tangled working tree into separate, well-described commits.
 
-If you changed authentication and pagination in the same sitting, this tool
-figures out which changes belong to which feature, splits them into separate
-commits, and writes a Conventional Commits message for each.
+You spent the afternoon on authentication *and* pagination. Now you have
+fourteen changed files and one commit message that says "wip". This finds the
+seams and proposes one commit per feature, each with a Conventional Commits
+message.
 
-## Status
+**[Install from the VS Code Marketplace →](https://marketplace.visualstudio.com/items?itemName=salonimathure.atomize-commits)**
 
-**Complete.** One engine, three ways to use it.
+![The review panel](docs/review-panel.png)
 
-| Phase | What it adds | State |
-|---|---|---|
-| 1 | Hunk parsing, partial staging, CLI | done |
-| 2 | Relatedness graph + clustering | done |
-| 3 | Dependency ordering + LLM commit messages | done |
-| 4 | FastAPI service + Docker | done |
-| 5 | VS Code extension | done |
-| 6 | CI check for pull requests | done |
+Two unrelated features edited into the same file, pulled apart automatically.
+`login_route` and `checkout_route` sit three lines from each other in
+`routes.py`, and they end up in different commits.
 
-## Quick start
+---
 
-```bash
-cd engine                     # no dependencies to install
+## The problem
 
-# what changed, broken into hunks
-python3 -m splitter --repo ~/your-repo list -v
+Git decides what belongs together by *proximity*. Two functions written next to
+each other land in the same hunk whether or not they have anything to do with
+one another, so the smallest thing you can move is already too big. The result
+is commits like "wip: auth + pagination + fix" that nobody can revert, bisect,
+or review.
 
-# prove the parser loses nothing
-python3 -m splitter --repo ~/your-repo verify
+## The approach
 
-# let the tool propose a split, with its reasoning
-python3 -m splitter --repo ~/your-repo group
+Model it as community detection.
 
-# see the raw relatedness scores (use this when tuning weights)
-python3 -m splitter --repo ~/your-repo why
+1. **Cut the diff into hunks**, then cut those further at function and import
+   boundaries — otherwise two adjacent features are one inseparable unit.
+2. **Score every pair of hunks** on whether they sit in the same function,
+   whether one introduces a name the other uses, whether they are an
+   implementation and its test, and how much vocabulary they share.
+3. **Find the tight clusters** with Louvain modularity optimisation. Each
+   cluster becomes a commit.
+4. **Order the commits** so nothing is referenced before the commit that
+   creates it.
+5. **Write the messages** with a language model, or from code structure when no
+   model is configured.
 
-# preview the whole plan, then run it
-python3 -m splitter --repo ~/your-repo apply --dry-run
-python3 -m splitter --repo ~/your-repo apply
+The signal that matters most is deliberately *negative*: two hunks in the same
+file but different functions score almost nothing. File proximity is exactly
+what makes naive tools glue unrelated work together.
 
-# or drive it by hand
-python3 -m splitter --repo ~/your-repo commit -m "feat(auth): ..." -H a784e4
-```
+## Does it work?
 
-Hunks are addressed by a short content hash, a full id
-(`app/auth.py#a784e4`), or a file path meaning "every hunk in this file".
+Real repositories are full of ground truth — developers already split their
+work into commits. So the benchmark squashes N consecutive commits into one
+messy tree and checks whether the tool puts them back.
 
-Run everything with `make test`.
+Comparing two groupings needs care, because labels are arbitrary: our "commit
+1" may be their "commit 3". So we score *pairs* — for every pair of hunks, did
+the developer group them, and did we?
 
-| Suite | Tests | Covers |
-|---|---|---|
-| `engine/tests` | 50 | parsing, splitting, grouping, ordering, messages |
-| `service/tests` | 22 | the analysis core and the HTTP API |
-| `ci/tests` | 25 | the PR check, against a stub HTTP server |
-| `eval/tests` | 10 | the scoring metrics |
-| `extension/test` | 39 | argument building, merging, HTML escaping |
+**Flask, 30 windows of 3 commits, 778 hunks:**
 
-## How the pieces fit
+| algorithm | F1 | precision | recall | ARI |
+|---|---|---|---|---|
+| Louvain | 0.411 | **0.728** | 0.336 | 0.198 |
+| label propagation | 0.413 | 0.717 | 0.349 | 0.183 |
 
-```
-gitrepo.py    shells out to git; every call is one you could type yourself
-parser.py     git diff text  ->  FileDiff / Hunk objects
-subhunks.py   cuts oversized hunks at function boundaries
-models.py     the Hunk and FileDiff dataclasses
-symbols.py    which function/class does a line live in? (regex today,
-              tree-sitter later — swapping it touches only this file)
-features.py   builds a profile card per hunk
-grouping.py   scores every pair, builds the graph, runs Louvain
-core.py       the whole analysis with git removed; CLI and service both
-              call this, so they cannot drift apart
-ordering.py   sorts commits so nothing is used before it exists
-llm.py        pluggable model providers, stdlib HTTP only
-messages.py   Conventional Commits generation and validation
-patch.py      a subset of hunks  ->  patch text git will accept
-cli.py        list / verify / group / why / apply / commit
-```
+![Benchmark output](docs/benchmark.png)
 
-## How the grouping decides
+**It over-splits** — around 7 proposed commits where the developer made 3.
+Precision of 0.73 says the groupings it does make are usually right; the recall
+gap is changes a human bundled that share no structural link at all. A feature
+and its CHANGELOG entry. A fix and a version bump. Intent is not visible in a
+diff, and this approach only sees the diff.
 
-Every pair of hunks gets a score. The weights live in one dict at the top of
-`grouping.py` — that is the dial board for the whole system.
+For a tool that *suggests* commits, that is the right way round to be wrong. An
+extra commit is a nuisance; a commit bundling unrelated work is the problem the
+tool exists to solve.
 
-| Signal | Weight | Why |
-|---|---|---|
-| same enclosing function | 0.60 | strongest structural evidence |
-| one defines what the other uses | 0.55 | a genuine code dependency |
-| same file | 0.30 | weak, and deliberately overridden below |
-| **same file, different functions** | **0.08** | the tangled case: file proximity must not glue unrelated features together |
-| implementation and its test | 0.45 | `auth.py` + `test_auth.py` |
-| shared vocabulary | 0.40 x overlap | scaled by Jaccard similarity |
-| historically committed together | 0.20 x strength | mined from `git log` |
-| same directory | 0.12 | tiebreaker only |
-
-Pairs scoring under 0.35 get no edge at all. Louvain then finds groups that are
-densely connected inside and sparsely connected outside, and picks the number
-of groups by itself — which matters, because you never know in advance how many
-features got tangled.
-
-## The one idea worth remembering
-
-We apply patches to the git **index**, which is identical to HEAD at the moment
-we apply. That means every hunk's `-` side line numbers are always correct, and
-only the `+` side needs fixing when we skip hunks:
-
-```
-new_start = old_start + offset
-offset   += (new_count - old_count)   # advances only for included hunks
-```
-
-`test_skipping_middle_hunk_lands_correctly` is the regression test for this.
-If you change `patch.py`, run it.
-
-## Commit messages
-
-Messages come from a language model when one is configured, and from
-structural heuristics otherwise. The tool works fully offline; the model is an
-upgrade, never a requirement.
-
-```bash
-# free and private: a model on your own machine
-export SPLITTER_LLM=ollama
-export SPLITTER_MODEL=qwen2.5-coder:7b
-
-# or bring your own key
-export SPLITTER_LLM=gemini      && export GEMINI_API_KEY=...
-export SPLITTER_LLM=anthropic   && export ANTHROPIC_API_KEY=...
-export SPLITTER_LLM=openai      && export OPENAI_API_KEY=...
-
-# or turn it off entirely
-export SPLITTER_LLM=none
-```
-
-Check your setup before relying on it — a misconfigured model fails quietly by
-falling back to heuristics, which is easy to miss:
-
-```bash
-python3 -m splitter --repo . doctor
-```
-
-`doctor` reads the provider's own error back to you — retired model names,
-rejected keys, and an unreachable Ollama each get a specific fix rather than a
-stack trace.
-
-**On credentials.** Keys are read from the environment and never written to
-disk. The Gemini key travels as a request header rather than a query string,
-because query strings end up in shell history and proxy logs. Anything that
-looks like a credential is masked before it reaches a terminal or an error
-message — see `redact()` in `llm.py` and its tests.
-
-**Model names go stale.** Providers retire them every few months. If a
-default stops working, override it rather than editing the code:
-
-```bash
-export SPLITTER_MODEL=gemini-3.6-flash
-```
-
-## See it work
-
-`demo.sh` rebuilds a repo where payments and authentication were edited into
-the same file, then shows the grouping, the heuristic messages, and your
-model's messages side by side.
-
-```bash
-cd engine
-./demo.sh                # rebuild and show the plan
-./demo.sh --commit       # ...and make the commits, with safety checks
-```
-
-Every reply is validated against Conventional Commits before use: unknown
-types, empty subjects, trailing periods, and over-long headers are rejected or
-repaired, and anything unusable falls back to the heuristic message. The model
-never sees the whole diff — only a compact summary of each proposed commit,
-which keeps calls small and cheap.
-
-## Commit ordering
-
-Grouping says *what* belongs together; it says nothing about *when*. If the
-auth commit imports something the payments commit creates, checking out the
-auth commit alone gives an ImportError.
-
-`ordering.py` builds a second graph — group A before group B whenever A
-introduces a name B uses — and topologically sorts it. Genuine cycles are
-reported and the weakest link broken, rather than failing.
-
-## Running as a service
-
-The engine assumed a checkout on local disk: run `git diff`, read files, mine
-`git log`. A web service has none of that, so `core.py` takes plain data in and
-gives plain data out. The CLI gathers that data from git; the service receives
-it in a request body. One implementation, two front doors.
-
-```bash
-make docker-run                    # build and start
-open http://localhost:8000/docs    # interactive API documentation
-
-curl localhost:8000/health
-curl localhost:8000/ready          # also reports model configuration
-
-curl -X POST localhost:8000/analyze \
-  -H 'Content-Type: application/json' \
-  -d "{\"diff\": $(git diff | jq -Rs .), \"messages\": false}"
-```
-
-FastAPI generates `/docs` from the Pydantic schemas in `service/schemas.py`,
-so the documentation cannot drift from the code — two tests assert the
-generated OpenAPI document contains the endpoints and their error codes.
-
-Request bodies are validated by the schema before the endpoint runs. A body
-of the wrong shape returns 422; a diff or file set that is too large returns
-413. Declaring response models too means FastAPI filters outgoing payloads to
-exactly those fields, so nothing internal can leak by accident.
-
-`POST /analyze` takes `diff` (required), `files` (optional map of path to
-current contents — improves symbol detection), `co_change` (optional, mined
-from the caller's history), and `messages` (optional bool).
-
-The service is stateless: it never clones a repo, writes to disk, or holds
-anything between requests. Any replica can answer any request, which is what
-makes scaling it trivial. It also never commits — applying commits needs your
-working tree and your git credentials, so that stays on your machine.
-
-**On privacy.** Sending a diff to a server means your code leaves your
-machine. That is why the whole thing ships as a container you can run
-yourself: `docker compose up` and the service is on your laptop.
-
-## Does it actually work?
-
-Real repositories are full of ground truth: developers already split their work
-into commits. So `eval/` takes N consecutive commits, squashes them into one
-messy working tree, and checks whether the splitter puts them back the way the
-developer had them.
+Louvain and label propagation are within noise of each other here, which is
+worth saying plainly. Louvain wins on Adjusted Rand Index and pulls clearly
+ahead on graphs with a strong bridge between two dense clusters, so it is the
+default — but on real hunk graphs the gap is small.
 
 ```bash
 python eval/recover.py --repo ~/src/some-project --windows 30 --compare
 ```
 
-Comparing two groupings needs care, because the labels are arbitrary — our
-"commit 1" may be their "commit 3". So we score *pairs*: for every pair of
-hunks, did the developer put them together, and did we? That gives precision,
-recall and F1, plus Adjusted Rand Index which corrects for pairs that match by
-chance.
+## Running it
 
-On a synthetic benchmark where every commit touches three shared files — the
-hard case, and the realistic one:
+**In VS Code** — install from the Marketplace, then run **Split Changes into
+Commits**. Requires Python 3.10+; the engine ships inside the extension and
+uses only the standard library.
 
-| | F1 | precision | recall |
-|---|---|---|---|
-| Louvain | 0.667 | **1.000** | 0.500 |
-| label propagation | 0.667 | 1.000 | 0.500 |
+**From the command line:**
 
-Perfect precision, half the recall: **it never groups unrelated changes, but it
-over-splits**, proposing about six commits where the developer made three. For
-a tool that rewrites history that is the right way round to be wrong — a commit
-that is too small is a nuisance, one that bundles unrelated work is the problem
-we set out to fix.
-
-Sweeping the parameters against this benchmark confirmed the defaults:
-
-| merge threshold | word weight | F1 | precision |
-|---|---|---|---|
-| **0.35** | **0.40** | **0.667** | **1.000** |
-| 0.28 | 0.40 | 0.548 | 0.857 |
-| 0.22 | 0.40 | 0.310 | 0.321 |
-| 0.35 | 0.55 | 0.250 | 0.500 |
-
-Lowering the threshold makes things worse, not better: the extra weak edges let
-clusters chain into each other and precision collapses.
-
-## Why Louvain
-
-Both algorithms are implemented in `graphs.py`, in pure Python, and the harness
-above is how the default was chosen. They agree on clearly separated clusters.
-They part company when a single strong edge links two dense groups:
-
-```
-two triangles joined by one heavy edge
-  louvain            2 groups   Q = 0.357
-  label propagation  1 group    Q = 0.000
+```bash
+cd engine
+python3 -m splitter --repo ~/your-repo group      # see the proposed split
+python3 -m splitter --repo ~/your-repo why        # see the raw scores
+python3 -m splitter --repo ~/your-repo apply      # do it
 ```
 
-Label propagation is purely local — each node joins whichever neighbour pulls
-hardest — so it chains across the bridge and swallows both groups. Louvain
-optimises modularity globally, collapsing communities into single nodes and
-re-partitioning, so it can undo a bad local decision. Modularity of 0 means the
-grouping is no better than random, which is exactly what the merged answer is.
+**As a pull request check** — the GitHub Action builds the container, sends it
+the PR's diff, and comments if the PR bundles unrelated changes:
 
-## Two products, one engine
+> ### This pull request contains 3 unrelated changes
+>
+> **1.** `feat(payments): add stripe charging` — 3 files, +17 −0
+> **2.** `feat(auth): add JWT verification` — 2 files, +13 −0
+> **3.** `fix(api): correct pagination offset` — 1 file, +2 −2
 
-| | Where it runs | What it does |
+It never fails the build. A tool that blocks merges over style gets switched
+off within a week; one that leaves a useful comment gets read.
+
+## Commit messages
+
+Structural heuristics by default — no network calls, nothing leaves your
+machine. Configure a model for better ones:
+
+```bash
+export SPLITTER_LLM=ollama      # local, free, private
+export SPLITTER_LLM=gemini      && export GEMINI_API_KEY=...
+export SPLITTER_LLM=anthropic   && export ANTHROPIC_API_KEY=...
+export SPLITTER_LLM=openai      && export OPENAI_API_KEY=...
+
+python3 -m splitter --repo . doctor
+```
+
+The model never sees the full diff — only a compact summary of each proposed
+commit. Every reply is validated against Conventional Commits before use;
+unknown types, empty subjects and over-long headers are repaired or rejected,
+and anything unusable falls back to the heuristic message.
+
+| | Message |
+|---|---|
+| heuristic | `feat: add charge_card, checkout_route, test_charge_card` |
+| model | `feat(payments): add stripe payment integration and checkout route` |
+
+## Layout
+
+```
+engine/      the analysis. Pure standard library, so it can be bundled.
+service/     FastAPI wrapper. Stateless; never commits anything.
+extension/   the VS Code extension. A thin client over the engine.
+ci/          the pull request check.
+eval/        the benchmark harness.
+```
+
+`engine/splitter/core.py` is the seam: it takes a diff and a file-content
+lookup and returns proposed commits. Nothing in it knows about git, HTTP or
+editors. That is why the CLI, the extension and the API share one
+implementation, and why swapping Flask for FastAPI touched a single directory.
+
+| | Tests | Covers |
 |---|---|---|
-| **VS Code extension** | your machine | Split changes *before* you commit |
-| **Pull request check** | GitHub Actions | Flag PRs that bundle unrelated changes |
-
-The extension calls the local Python directly. The PR check needs the
-container — a webhook has no laptop to shell out to, and CI gets a working
-engine without installing packages or pinning versions.
-
-## The pull request check
-
-On every pull request, the workflow builds the image, starts the service,
-sends it the PR's diff, and comments if the changes should have been several
-commits:
-
-> ### This pull request contains 2 unrelated changes
->
-> **1. `feat(payments): add stripe charging`**
-> 3 files · +17 −0
->
-> **2. `feat(auth): add JWT verification`**
-> 2 files · +13 −0
-
-Design decisions worth knowing:
-
-- **It never fails the build.** A tool that blocks merges over style gets
-  switched off in a week; one that leaves a useful comment gets read. Pass
-  `--fail-over N` if you want it strict.
-- **It edits its own comment** rather than posting a new one per push, and
-  deletes it once the PR becomes one coherent change.
-- **A broken analysis is not a broken build.** If the service is unreachable,
-  the check logs a warning and exits zero.
-- **`base...head`, not `base..head`** — three dots compares against the merge
-  base, so commits that landed on the base branch after the PR opened are not
-  blamed on the author.
-
-Try it locally:
+| `engine/tests` | 50 | parsing, splitting, grouping, ordering, messages |
+| `extension/test` | 44 | argument building, merging, HTML escaping |
+| `ci/tests` | 25 | the PR check, against a stub HTTP server |
+| `service/tests` | 22 | the analysis core and the HTTP API |
+| `eval/tests` | 10 | the scoring metrics |
 
 ```bash
-python3 ci/hygiene.py --service http://localhost:8000 \
-    --base main --head HEAD --dry-run
+make test
 ```
 
-## The editor extension
+## Notes on the implementation
 
-`extension/` is a VS Code extension in plain JavaScript — no build step, so
-there is no compiler between you and a working plugin.
+**No dependencies in the engine.** Louvain and the topological sort are written
+out in `graphs.py`. An extension that says "first install Python, then pip
+install networkx" is one nobody keeps.
 
-```bash
-cd extension
-npm test          # 37 tests, zero dependencies
-code .            # then press F5 to launch it
+**Applying a partial patch is the load-bearing trick.** Patches go to the git
+*index*, which equals HEAD at that moment, so every hunk's `-` side line numbers
+are correct no matter which hunks we skip. Only the `+` side needs recomputing:
+
+```python
+new_start = old_start + offset
+offset   += (new_count - old_count)   # advances only for included hunks
 ```
 
-It is a thin client by design: it runs `python -m splitter plan`, renders the
-JSON, lets you edit messages and merge commits, then sends the reviewed plan
-back to `python -m splitter apply --plan`. No analysis is reimplemented in
-JavaScript, so everything interesting stays covered by the Python tests.
+Get it wrong and git applies the change in the wrong place.
+`test_skipping_middle_hunk_lands_correctly` is the guard.
 
-Two decisions worth knowing about:
-
-- The plan travels to Python through a **temp file, not the command line**.
-  Commit messages are arbitrary user text, and putting that on a command line
-  is how quoting bugs and injection problems begin.
-- Everything rendered in the panel is **HTML-escaped**. The strings shown are
-  source code the user just wrote, so they are full of angle brackets and
-  quotes; five tests cover this specifically.
+**Everything degrades.** No model configured, model unreachable, model returns
+a made-up commit type, model wraps its JSON in prose — each falls back to a
+valid heuristic message. A tool that rewrites git history must never break
+because an API call timed out.
 
 ## Known limits
 
-- **Mixed add/remove hunks are never split.** `subhunks.py` only cuts runs of
-  pure additions, because reasoning about interleaved deletions is where
-  correctness bugs live.
-- **Symbol detection is regex-based**, not a real parse. Good on ordinary
-  Python, JS/TS, Go, and Java; weaker on heavy macros or unusual formatting.
-  `symbols.py` is the only file tree-sitter would replace.
-- **Commit order is not dependency-aware yet.** In the demo, the auth commit
-  imports `charge_card` before the payments commit creates it, so commit 1
-  would not run on its own. Ordering by def/use edges is a Phase 3 job;
-  actually *checking* it is the Kubernetes verification work in Phase 6.
-- Binary files and renames are all-or-nothing (`FileDiff.is_atomic`).
-- Paths containing spaces may parse incorrectly in exotic cases.
+- Mixed add/remove hunks are never split; only runs of pure additions are cut.
+- Symbol detection is regex-based, not a real parse. Good on ordinary Python,
+  JS/TS, Go and Java. `symbols.py` is the only file tree-sitter would replace.
+- Binary files and renames travel whole.
+- Nothing verifies that each commit actually builds. The ordering pass catches
+  name-level dependencies, which is a proxy rather than a proof.
+
+## Licence
+
+MIT.
