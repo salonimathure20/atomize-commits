@@ -2,6 +2,10 @@
 __pycache__/
 *.py[codz]
 *$py.class
+*.pyc
+.venv/
+venv/
+.pytest_cache/
 
 # C extensions
 *.so
@@ -216,3 +220,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Node
+node_modules/
+
+# Editor and OS
+.DS_Store
+
+# Build output — never commit these
+*.vsix
+extension/engine/
